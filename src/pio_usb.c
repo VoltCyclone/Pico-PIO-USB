@@ -40,7 +40,27 @@ static uint8_t pre_encoded[5];
 // Bus functions
 //--------------------------------------------------------------------+
 
-static void __no_inline_not_in_flash_func(send_pre)(pio_port_t *pp) {
+static void __not_in_flash_func(pio_usb_bus_tx_reset)(pio_port_t *pp) {
+  dma_channel_abort(pp->tx_ch);
+  pio_sm_clear_fifos(pp->pio_usb_tx, pp->sm_tx);
+  pio_sm_exec(pp->pio_usb_tx, pp->sm_tx, pp->tx_reset_instr);
+  pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK;
+}
+
+// Iteration-count limits for TX spin loops. Using iteration counts instead
+// of timer reads avoids APB bus contention with PIO register polling.
+// At 240MHz with ~4 cycles/iteration:
+//   24,000 iters ≈ 400us (covers FS 64B packet ~53us with huge margin)
+//  240,000 iters ≈ 4ms   (covers LS 8B packet ~426us with huge margin)
+//    2,400 iters ≈ 40us  (covers EOP at FS, only a few bit-times)
+//   20,000 iters ≈ 333us (covers EOP at LS)
+#define TX_IRQ_TIMEOUT_FS   24000
+#define TX_IRQ_TIMEOUT_LS  240000
+#define TX_EOP_TIMEOUT_FS    2400
+#define TX_EOP_TIMEOUT_LS   20000
+#define TX_PRE_TIMEOUT      24000
+
+static bool __no_inline_not_in_flash_func(send_pre)(pio_port_t *pp) {
   // send PRE token in full-speed
   pp->low_speed = false;
   uint16_t instr = pp->fs_tx_pre_program->instructions[0];
@@ -53,17 +73,25 @@ static void __no_inline_not_in_flash_func(send_pre)(pio_port_t *pp) {
   dma_channel_transfer_from_buffer_now(pp->tx_ch, pre_encoded,
                                        sizeof(pre_encoded));
 
-  while ((pp->pio_usb_tx->irq & IRQ_TX_EOP_MASK) == 0) {
-    continue;
+  // PRE is a short token at full-speed (~4 bytes at 12Mbps = ~2.7us)
+  for (uint32_t i = 0; i < TX_PRE_TIMEOUT; i++) {
+    if ((pp->pio_usb_tx->irq & IRQ_TX_EOP_MASK) != 0) goto pre_eop_done;
   }
+  pio_usb_bus_tx_reset(pp);
+  return false;
+pre_eop_done:
+
   // Wait for complete transmission of the PRE packet. We don't want to
   // accidentally send trailing Ks in low speed mode due to an early start
   // instruction that re-enables the outputs.
   uint32_t stall_mask = 1 << (PIO_FDEBUG_TXSTALL_LSB + pp->sm_tx);
   pp->pio_usb_tx->fdebug = stall_mask; // clear sticky stall mask bit
-  while (!(pp->pio_usb_tx->fdebug & stall_mask)) {
-    continue;
+  for (uint32_t i = 0; i < TX_PRE_TIMEOUT; i++) {
+    if (pp->pio_usb_tx->fdebug & stall_mask) goto pre_stall_done;
   }
+  pio_usb_bus_tx_reset(pp);
+  return false;
+pre_stall_done:
 
   // change bus speed to low-speed
   pp->low_speed = true;
@@ -73,46 +101,57 @@ static void __no_inline_not_in_flash_func(send_pre)(pio_port_t *pp) {
   SM_SET_CLKDIV(pp->pio_usb_tx, pp->sm_tx, pp->clk_div_ls_tx);
   pio_sm_set_enabled(pp->pio_usb_tx, pp->sm_tx, true);
 
-  // pio_sm_clear_fifos(pp->pio_usb_tx, pp->sm_tx);
-  // pio_sm_exec(pp->pio_usb_tx, pp->sm_tx, pp->tx_start_instr);
-  // SM_SET_CLKDIV_MAXSPEED(pp->pio_usb_rx, pp->sm_rx);
-
   pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_eop, false);
   SM_SET_CLKDIV(pp->pio_usb_rx, pp->sm_eop, pp->clk_div_ls_rx);
   pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_eop, true);
+
+  return true;
 }
 
-void __not_in_flash_func(pio_usb_bus_usb_transfer)(pio_port_t *pp,
+bool __not_in_flash_func(pio_usb_bus_usb_transfer)(pio_port_t *pp,
                                               uint8_t *data, uint16_t len) {
   if (pp->need_pre) {
-    send_pre(pp);
+    if (!send_pre(pp)) {
+      return false;
+    }
   }
 
   pio_sm_exec(pp->pio_usb_tx, pp->sm_tx, pp->tx_start_instr);
   dma_channel_transfer_from_buffer_now(pp->tx_ch, data, len);
   pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
 
-  io_ro_32 *pc = &pp->pio_usb_tx->sm[pp->sm_tx].addr;
-  while ((pp->pio_usb_tx->irq & IRQ_TX_ALL_MASK) == 0) {
-    continue;
+  // Wait for TX completion using iteration count to avoid APB bus contention
+  uint32_t const tx_limit = pp->low_speed ? TX_IRQ_TIMEOUT_LS : TX_IRQ_TIMEOUT_FS;
+  for (uint32_t i = 0; i < tx_limit; i++) {
+    if ((pp->pio_usb_tx->irq & IRQ_TX_ALL_MASK) != 0) goto tx_done;
   }
+  pio_usb_bus_tx_reset(pp);
+  return false;
+tx_done:
   pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
 
+  // Wait for EOP completion via program counter
+  io_ro_32 *pc = &pp->pio_usb_tx->sm[pp->sm_tx].addr;
+  uint32_t const eop_limit = pp->low_speed ? TX_EOP_TIMEOUT_LS : TX_EOP_TIMEOUT_FS;
   if (pp->low_speed) {
     // For Low speed host, wait until EOP is fully sent. Otherwise, we can send another packet
     // before inter-packet delay timeout, which is 2-bit time by USB specs.
-    // For Full speed, our overhead is probably enough without this additional wait.
-    while (*pc <= PIO_USB_TX_ENCODED_DATA_COMP) {
-      continue;
+    for (uint32_t i = 0; i < eop_limit; i++) {
+      if (*pc > PIO_USB_TX_ENCODED_DATA_COMP) goto eop_done;
     }
   } else {
-    while (*pc < PIO_USB_TX_ENCODED_DATA_COMP) {
-      continue;
+    for (uint32_t i = 0; i < eop_limit; i++) {
+      if (*pc >= PIO_USB_TX_ENCODED_DATA_COMP) goto eop_done;
     }
   }
+  pio_usb_bus_tx_reset(pp);
+  return false;
+eop_done:
+
+  return true;
 }
 
-void __no_inline_not_in_flash_func(pio_usb_bus_send_token)(pio_port_t *pp,
+bool __no_inline_not_in_flash_func(pio_usb_bus_send_token)(pio_port_t *pp,
                                                            uint8_t token,
                                                            uint8_t addr,
                                                            uint8_t ep_num) {
@@ -126,7 +165,7 @@ void __no_inline_not_in_flash_func(pio_usb_bus_send_token)(pio_port_t *pp,
   uint8_t packet_encoded[sizeof(packet) * 2 * 7 / 6 + 2];
   uint8_t encoded_len = pio_usb_ll_encode_tx_data(packet, sizeof(packet), packet_encoded);
 
-  pio_usb_bus_usb_transfer(pp, packet_encoded, encoded_len);
+  return pio_usb_bus_usb_transfer(pp, packet_encoded, encoded_len);
 }
 
 void __no_inline_not_in_flash_func(pio_usb_bus_prepare_receive)(const pio_port_t *pp) {
@@ -242,13 +281,15 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
       if (handshake == USB_PID_ACK) {
         // Only ACK if crc matches
         if (idx >= 4 && crc_match) {
-          pio_usb_bus_usb_transfer(pp, ack_encoded, 5);
+          if (!pio_usb_bus_usb_transfer(pp, ack_encoded, 5)) {
+            return -1; // ACK handshake failed; device will retry
+          }
           return idx - 4;
         }
       } else if (handshake == USB_PID_NAK) {
-        pio_usb_bus_usb_transfer(pp, nak_encoded, 5);
+        pio_usb_bus_usb_transfer(pp, nak_encoded, 5); // best effort
       } else {
-        pio_usb_bus_usb_transfer(pp, stall_encoded, 5);
+        pio_usb_bus_usb_transfer(pp, stall_encoded, 5); // best effort
       }
       break;
     } else if (get_time_us_32() - start > 7) {

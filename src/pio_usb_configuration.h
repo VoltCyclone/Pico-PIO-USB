@@ -43,10 +43,26 @@ typedef struct {
         PIO_USB_DEBUG_PIN_NONE, false, PIO_USB_PINOUT_DPDM                 \
   }
 
+#ifndef PIO_USB_EP_POOL_CNT
 #define PIO_USB_EP_POOL_CNT 32
-#define PIO_USB_DEV_EP_CNT 16
-#define PIO_USB_DEVICE_CNT 4
-#define PIO_USB_HUB_PORT_CNT 8
-#define PIO_USB_ROOT_PORT_CNT 2
+#endif
 
+#ifndef PIO_USB_DEV_EP_CNT
+#define PIO_USB_DEV_EP_CNT 16
+#endif
+
+#ifndef PIO_USB_DEVICE_CNT
+#define PIO_USB_DEVICE_CNT 4
+#endif
+
+#ifndef PIO_USB_HUB_PORT_CNT
+#define PIO_USB_HUB_PORT_CNT 8
+#endif
+
+#ifndef PIO_USB_ROOT_PORT_CNT
+#define PIO_USB_ROOT_PORT_CNT 2
+#endif
+
+#ifndef PIO_USB_EP_SIZE
 #define PIO_USB_EP_SIZE 64
+#endif

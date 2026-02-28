@@ -132,11 +132,11 @@ void pio_usb_bus_init(pio_port_t *pp, const pio_usb_configuration_t *c,
 
 void pio_usb_bus_prepare_receive(const pio_port_t *pp);
 int pio_usb_bus_receive_packet_and_handshake(pio_port_t *pp, uint8_t handshake);
-void pio_usb_bus_usb_transfer(pio_port_t *pp, uint8_t *data,
+bool pio_usb_bus_usb_transfer(pio_port_t *pp, uint8_t *data,
                               uint16_t len);
 
 uint8_t pio_usb_bus_wait_handshake(pio_port_t *pp);
-void pio_usb_bus_send_token(pio_port_t *pp, uint8_t token, uint8_t addr,
+bool pio_usb_bus_send_token(pio_port_t *pp, uint8_t token, uint8_t addr,
                             uint8_t ep_num);
 
 static __always_inline port_pin_status_t
@@ -167,8 +167,10 @@ pio_usb_bus_get_line_state(root_port_t *root) {
 
 static __always_inline void pio_usb_bus_start_receive(const pio_port_t *pp) {
   pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
-  while ((pp->pio_usb_rx->irq & IRQ_RX_ALL_MASK) != 0) {
-    continue;
+  for (uint32_t i = 0; i < 100; i++) {
+    if ((pp->pio_usb_rx->irq & IRQ_RX_ALL_MASK) == 0) {
+      return;
+    }
   }
 }
 

@@ -73,7 +73,7 @@ typedef struct {
   volatile bool transfer_started;
   volatile bool transfer_aborted;
 
-  uint8_t buffer[(64 + 4) * 2 * 7 / 6 + 2];
+  uint8_t buffer[(PIO_USB_EP_SIZE + 4) * 2 * 7 / 6 + 2];
   uint8_t encoded_data_len;
   uint8_t failed_count;
 

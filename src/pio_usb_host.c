@@ -19,9 +19,9 @@
 #include "pio_usb_ll.h"
 #include "usb_crc.h"
 
-enum {
-  TRANSACTION_MAX_RETRY = 3, // Number of times to retry a failed transaction
-};
+#ifndef PIO_USB_TRANSACTION_MAX_RETRY
+#define PIO_USB_TRANSACTION_MAX_RETRY 3
+#endif
 
 static alarm_pool_t *_alarm_pool = NULL;
 static repeating_timer_t sof_rt;
@@ -397,11 +397,16 @@ void pio_usb_host_port_reset_end(uint8_t root_idx) {
   gpio_set_oeover(root->pin_dm,  GPIO_OVERRIDE_NORMAL);
   gpio_set_outover(root->pin_dp,  GPIO_OVERRIDE_NORMAL);
   gpio_set_outover(root->pin_dm,  GPIO_OVERRIDE_NORMAL);
-  busy_wait_us(100); // TODO check if this is neccessary
+  // GPIO settling time after releasing overrides back to PIO control.
+  // USB 2.0 reset recovery (10ms) is handled by TinyUSB enumeration.
+  // This only covers electrical settling + RP2350-E9 stabilization.
+  busy_wait_us(10);
 
   // bus back to operating
   root->suspended = false;
 }
+
+static uint8_t ep_pool_used_count = 0;
 
 void pio_usb_host_close_device(uint8_t root_idx, uint8_t device_address) {
   for (int ep_pool_idx = 0; ep_pool_idx < PIO_USB_EP_POOL_CNT; ep_pool_idx++) {
@@ -410,11 +415,12 @@ void pio_usb_host_close_device(uint8_t root_idx, uint8_t device_address) {
         ep->size) {
       ep->size = 0;
       ep->has_transfer = false;
+      if (ep_pool_used_count > 0) ep_pool_used_count--;
     }
   }
 }
 
-static inline __force_inline endpoint_t * _find_ep(uint8_t root_idx, 
+static inline __force_inline endpoint_t * _find_ep(uint8_t root_idx,
                                                    uint8_t device_address, uint8_t ep_address) {
   for (int ep_pool_idx = 0; ep_pool_idx < PIO_USB_EP_POOL_CNT; ep_pool_idx++) {
     endpoint_t *ep = PIO_USB_ENDPOINT(ep_pool_idx);
@@ -445,10 +451,13 @@ bool pio_usb_host_endpoint_open(uint8_t root_idx, uint8_t device_address,
       ep->dev_addr = device_address;
       ep->need_pre = need_pre;
       ep->is_tx = (d->epaddr & 0x80) ? false : true; // host endpoint out is tx
+      ep_pool_used_count++;
       return true;
     }
   }
 
+  printf("PIO-USB: endpoint pool exhausted (used=%d/%d), cannot open ep 0x%02X for dev %d\r\n",
+         ep_pool_used_count, PIO_USB_EP_POOL_CNT, d->epaddr, device_address);
   return false;
 }
 
@@ -460,6 +469,7 @@ bool pio_usb_host_endpoint_close(uint8_t root_idx, uint8_t device_address,
   }
 
   ep->size = 0; // mark as closed
+  if (ep_pool_used_count > 0) ep_pool_used_count--;
   return true;
 }
 
@@ -540,7 +550,9 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
   uint8_t expect_pid = (ep->data_id == 1) ? USB_PID_DATA1 : USB_PID_DATA0;
 
   pio_usb_bus_prepare_receive(pp);
-  pio_usb_bus_send_token(pp, USB_PID_IN, ep->dev_addr, ep->ep_num);
+  if (!pio_usb_bus_send_token(pp, USB_PID_IN, ep->dev_addr, ep->ep_num)) {
+    return -1;
+  }
   pio_usb_bus_start_receive(pp);
 
   int receive_len = pio_usb_bus_receive_packet_and_handshake(pp, USB_PID_ACK);
@@ -563,7 +575,7 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
       res = -2;
     }
 
-    if (++ep->failed_count >= TRANSACTION_MAX_RETRY) {
+    if (++ep->failed_count >= PIO_USB_TRANSACTION_MAX_RETRY) {
       pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_ERROR_BITS); // failed after 3 consecutive retries
     }
   }
@@ -586,9 +598,13 @@ static int __no_inline_not_in_flash_func(usb_out_transaction)(pio_port_t *pp,
   uint16_t const xact_len = pio_usb_ll_get_transaction_len(ep);
 
   pio_usb_bus_prepare_receive(pp);
-  pio_usb_bus_send_token(pp, USB_PID_OUT, ep->dev_addr, ep->ep_num);
+  if (!pio_usb_bus_send_token(pp, USB_PID_OUT, ep->dev_addr, ep->ep_num)) {
+    return -1;
+  }
 
-  pio_usb_bus_usb_transfer(pp, ep->buffer, ep->encoded_data_len);
+  if (!pio_usb_bus_usb_transfer(pp, ep->buffer, ep->encoded_data_len)) {
+    return -1;
+  }
   pio_usb_bus_start_receive(pp);
 
   pio_usb_bus_wait_handshake(pp);
@@ -604,7 +620,7 @@ static int __no_inline_not_in_flash_func(usb_out_transaction)(pio_port_t *pp,
     pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_STALLED_BITS);
   } else {
     res = -1;
-    if (++ep->failed_count >= TRANSACTION_MAX_RETRY) {
+    if (++ep->failed_count >= PIO_USB_TRANSACTION_MAX_RETRY) {
       pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_ERROR_BITS);
     }
   }
@@ -626,11 +642,15 @@ static int __no_inline_not_in_flash_func(usb_setup_transaction)(
 
   // Setup token
   pio_usb_bus_prepare_receive(pp);
-  pio_usb_bus_send_token(pp, USB_PID_SETUP, ep->dev_addr, 0);
+  if (!pio_usb_bus_send_token(pp, USB_PID_SETUP, ep->dev_addr, 0)) {
+    return -1;
+  }
 
   // Data
   ep->data_id = 0; // set to DATA0
-  pio_usb_bus_usb_transfer(pp, ep->buffer, ep->encoded_data_len);
+  if (!pio_usb_bus_usb_transfer(pp, ep->buffer, ep->encoded_data_len)) {
+    return -1;
+  }
 
   // Handshake
   pio_usb_bus_start_receive(pp);
@@ -643,7 +663,7 @@ static int __no_inline_not_in_flash_func(usb_setup_transaction)(
   } else {
     res = -1;
     ep->data_id = USB_PID_SETUP; // retry setup
-    if (++ep->failed_count >= TRANSACTION_MAX_RETRY) {
+    if (++ep->failed_count >= PIO_USB_TRANSACTION_MAX_RETRY) {
       pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_ERROR_BITS);
     }
   }

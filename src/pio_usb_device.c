@@ -153,11 +153,20 @@ static void __no_inline_not_in_flash_func(usb_device_packet_handler)(void) {
     }
 
     pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
-    while ((pp->pio_usb_tx->irq & IRQ_TX_ALL_MASK) == 0) {
-      continue;
+    bool tx_ok = true;
+    // Device always responds at full-speed; use iteration count to avoid
+    // APB bus contention from timer reads in this tight loop.
+    for (uint32_t i = 0; i < 24000; i++) {
+      if ((pp->pio_usb_tx->irq & IRQ_TX_ALL_MASK) != 0) goto dev_tx_done;
     }
+    dma_channel_abort(pp->tx_ch);
+    pio_sm_clear_fifos(pp->pio_usb_tx, pp->sm_tx);
+    pio_sm_exec(pp->pio_usb_tx, pp->sm_tx, pp->tx_reset_instr);
+    pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK;
+    tx_ok = false;
+dev_tx_done:
 
-    if (has_transfer) {
+    if (has_transfer && tx_ok) {
       pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
       irq_clear(pp->device_rx_irq_num);
       pio_usb_bus_start_receive(pp);
